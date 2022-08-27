@@ -1,0 +1,94 @@
+#!/bin/sh
+# This is a keyscript for /etc/crypttab. Functionality wise, it is a merge of
+# - decrypt_keyctl, which allows not having to re-enter a password if multiple disks are unlocked with the same password
+# - ykluks-keyscript, which allows transforming a password through a yubikey chalresp so that both the password and the Yubikey are needed to unlock.
+# By themselves, each of those scripts above doesn't support the other, i.e. you would either have to not use a Yubikey or enter passwords multiple times.
+# This script combines both of those and solves the problem.
+#
+# This script was tested with PopOS 22.04, but should work with Ubuntu and maybe Debian as well.
+#
+# To use this script
+# 1. copy it to /usr/lib/cryptsetup/scripts
+# 2. mention it as a keyscript in /etc/crypttab (i.e. "keyscript=decrypt_keyctl_yubikey")
+# 3. Modify /usr/share/initramfs-tools/hooks/cryptkeyctl to always add the `keyctl` tool into the initramfs,
+#    the default version of that hook is set up to only add `keyctl` if `keyscript=decrypt_keyctl` but we also need it.
+
+message()
+{
+    if [ -x /bin/plymouth ] && plymouth --ping; then
+        plymouth message --text="$*"
+    else
+        echo "$@" >&2
+    fi
+    return 0
+}
+
+
+die()
+{
+    message "ABORT: $@"
+    sleep 5
+    exit 1
+}
+
+if [ -z "${CRYPTTAB_KEY:-}" ] || [ "$CRYPTTAB_KEY" = "none" ]; then
+    # store the passphrase in the key name used by systemd-ask-password
+    ID_="cryptsetup"
+else
+    # the keyfile given from crypttab is used as identifier in the keyring
+    # including the prefix "cryptsetup:"
+    ID_="cryptsetup:$CRYPTTAB_KEY"
+fi
+TIMEOUT_='60'
+ASKPASS_='/lib/cryptsetup/askpass'
+PROMPT_="Caching Yubikey passphrase for ${CRYPTTAB_NAME}: "
+
+# Set to "1" if you want both your password and Yubikey response be bundled together and writtent to key slot.
+CONCATENATE=0
+# Set to "1" if you want to hash your password with sha256.
+HASH=0
+
+check_yubikey_present="$(ykinfo -q -2)"
+
+# source for log_*_msg() functions, see LP: #272301
+if [ -e /scripts/functions ] ; then
+	. /scripts/functions
+else
+	. /usr/share/initramfs-tools/scripts/functions
+fi
+
+if ! KID_="$(keyctl search @u user "$ID_" 2>/dev/null)" || \
+        [ -z "$KID_" ] || [ "$CRYPTTAB_TRIED" -gt 0 ]; then
+    # key not found or wrong, ask the user
+    KEY_PW_="$($ASKPASS_ "$PROMPT_")" || die "Error executing $ASKPASS_"
+
+    if [ "$check_yubikey_present" = "1" ]; then
+	message "Accessing yubikey..."
+	if [ "$HASH" = "1" ]; then
+        	KEY_PW_=$(printf %s "$KEY_PW_" | sha256sum | awk '{print $1}')
+	fi
+        KEY_="$(printf %s "$KEY_PW_" | ykchalresp -2 -i- 2>/dev/null || true)"
+	message "Retrieved the response from the Yubikey"
+    else
+        KEY_="$(printf '%s' "$KEY_PW_")"
+        message "Yubikey not found"
+    fi
+
+    if [ -n "$KID_" ]; then
+        # I have cached wrong password and now i may use either `keyctl update`
+        # to update $KID_ or just unlink old key, and add new. With `update` i
+        # may hit "Key has expired", though. So i'll go "unlink and add" way.
+        keyctl unlink "$KID_" @u
+        KID_=""
+    fi
+    KID_="$(printf "%s" "$KEY_" | keyctl padd user "$ID_" @u)"
+    [ -n "$KID_" ] || die "Error adding passphrase to kernel keyring. Is keyctl present in the initramfs?"
+    if ! keyctl timeout "$KID_" "$TIMEOUT_"; then
+        keyctl unlink "$KID_" @u
+        die "Error setting timeout on key ($KID_), removing"
+    fi
+else
+    message "Using cached passphrase for ${CRYPTTAB_NAME}."
+fi
+
+keyctl pipe "$KID_"
